@@ -32,6 +32,7 @@ PRINT_HITS = True
 DIAG = False
 USE_JAVA_HELPER = True
 JAVA_HELPER_JAR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'decode', 'build', 'libs', 'decode-1.0-SNAPSHOT.jar')
+JAVA_HELPER_MODE = 'serve'
 
 RE_METHOD = re.compile(r"^\.method\b.*?\s([^\s(]+\(.*)$")
 RE_END_METHOD = re.compile(r"^\.end method\b")
@@ -409,58 +410,64 @@ class ManualTargetStringReplace(IScript):
     self.eval = SmaliEvaluator(self.repo)
     self.replcnt = 0
     self._changed_units = set()
-
-    if mode == 'all':
-      prj = ctx.getMainProject()
-      if not prj:
-        print('[!] No project')
+    self._decode_cache = {}
+    self._java_helper_proc = None
+    self._java_helper_stdio = None
+    self._java_helper_mode = None
+    try:
+      if mode == 'all':
+        prj = ctx.getMainProject()
+        if not prj:
+          print('[!] No project')
+          return
+        total_units = 0
+        for unit in prj.findUnits(IJavaSourceUnit):
+          try:
+            root = unit.getASTElement()
+          except Exception:
+            root = None
+          if not isinstance(root, IJavaClass):
+            continue
+          total_units += 1
+          self.cstbuilder = unit.getDecompiler().getHighLevelContext().getConstantFactory()
+          n = self._process_class(root)
+          if n:
+            self.replcnt += n
+            unit.notifyGenericChange()
+        print('[*] Processed %d Java units' % total_units)
+        print('[*] Replaced %d calls' % self.replcnt)
         return
-      total_units = 0
-      for unit in prj.findUnits(IJavaSourceUnit):
-        try:
-          root = unit.getASTElement()
-        except Exception:
-          root = None
-        if not isinstance(root, IJavaClass):
-          continue
-        total_units += 1
-        self.cstbuilder = unit.getDecompiler().getHighLevelContext().getConstantFactory()
-        n = self._process_class(root)
-        if n:
-          self.replcnt += n
-          unit.notifyGenericChange()
-      print('[*] Processed %d Java units' % total_units)
+
+      unit = f.getUnit()
+      if not isinstance(unit, IJavaSourceUnit):
+        print('[!] Focus a decompiled Java unit first')
+        return
+      root = unit.getASTElement()
+      if not isinstance(root, IJavaClass):
+        print('[!] Focus a Java class first')
+        return
+      self.cstbuilder = unit.getDecompiler().getHighLevelContext().getConstantFactory()
+
+      focused_method = self._get_focused_method(f)
+      if mode == 'method':
+        if not focused_method:
+          print('[!] Mode=method requires caret inside a Java method')
+          return
+        print('[*] Focused method: %s' % focused_method.getSignature())
+        self.replcnt += self._process_method(focused_method)
+      elif mode == 'class':
+        self.replcnt += self._process_class(root)
+      elif focused_method:
+        print('[*] Focused method: %s' % focused_method.getSignature())
+        self.replcnt += self._process_method(focused_method)
+      else:
+        self.replcnt += self._process_class(root)
+
+      if self.replcnt:
+        unit.notifyGenericChange()
       print('[*] Replaced %d calls' % self.replcnt)
-      return
-
-    unit = f.getUnit()
-    if not isinstance(unit, IJavaSourceUnit):
-      print('[!] Focus a decompiled Java unit first')
-      return
-    root = unit.getASTElement()
-    if not isinstance(root, IJavaClass):
-      print('[!] Focus a Java class first')
-      return
-    self.cstbuilder = unit.getDecompiler().getHighLevelContext().getConstantFactory()
-
-    focused_method = self._get_focused_method(f)
-    if mode == 'method':
-      if not focused_method:
-        print('[!] Mode=method requires caret inside a Java method')
-        return
-      print('[*] Focused method: %s' % focused_method.getSignature())
-      self.replcnt += self._process_method(focused_method)
-    elif mode == 'class':
-      self.replcnt += self._process_class(root)
-    elif focused_method:
-      print('[*] Focused method: %s' % focused_method.getSignature())
-      self.replcnt += self._process_method(focused_method)
-    else:
-      self.replcnt += self._process_class(root)
-
-    if self.replcnt:
-      unit.notifyGenericChange()
-    print('[*] Replaced %d calls' % self.replcnt)
+    finally:
+      self._close_java_helper()
 
   def _get_focused_method(self, frag):
     try:
@@ -482,12 +489,18 @@ class ManualTargetStringReplace(IScript):
     if body is None:
       return 0
     self.locals = {}
+    self._byte_array_cache = {}
+    self._const_int_cache = {}
+    self._const_byte_cache = {}
+    self._array_name_cache = {}
     count = 0
     i = 0
     while i < body.size():
       stm = body.get(i)
-      count += self._check_element(body, stm)
-      self._collect_assignments(stm)
+      pending_assignments = []
+      count += self._visit_element(body, stm, pending_assignments)
+      for assignment in pending_assignments:
+        self._apply_assignment(assignment)
       i += 1
     return count
 
@@ -500,14 +513,20 @@ class ManualTargetStringReplace(IScript):
         count += self._process_class(sub)
     return count
 
-  def _check_element(self, parent, e):
+  def _visit_element(self, parent, e, pending_assignments):
     count = 0
     if isinstance(e, IJavaCall) and self._try_replace_call(parent, e):
-      return 1
-    for sub in e.getSubElements():
+      count += 1
+    if isinstance(e, IJavaAssignment):
+      pending_assignments.append(e)
+    try:
+      subs = e.getSubElements()
+    except Exception:
+      return count
+    for sub in subs:
       if isinstance(sub, (IJavaClass, IJavaField, IJavaMethod)):
         continue
-      count += self._check_element(e, sub)
+      count += self._visit_element(e, sub, pending_assignments)
     return count
 
   def _try_replace_call(self, parent, call):
@@ -527,17 +546,26 @@ class ManualTargetStringReplace(IScript):
       return False
 
     plain = self._decode_with_java(sig, a1, a2)
+    used_fallback = False
+    if not isinstance(plain, string_types):
+      plain = self._fallback_decode(sig, a1, a2)
+      used_fallback = isinstance(plain, string_types)
     if not isinstance(plain, string_types):
       print('[!] decode failed: %s' % sig)
       return False
 
     if PRINT_HITS:
       print('[+] %s => %r' % (sig, plain))
+      if used_fallback:
+        print('[*] fallback used: %s' % sig)
 
     parent.replaceSubElement(call, self.cstbuilder.createString(plain))
     return True
 
   def _decode_with_java(self, sig, a1, a2):
+    cache_key = (sig, tuple(a1), tuple(a2))
+    if cache_key in self._decode_cache:
+      return self._decode_cache[cache_key]
     if not USE_JAVA_HELPER:
       return None
     if not os.path.isfile(JAVA_HELPER_JAR):
@@ -562,25 +590,147 @@ class ManualTargetStringReplace(IScript):
       ','.join(str(int(x)) for x in a2),
     ]
     try:
+      if JAVA_HELPER_MODE == 'serve':
+        plain = self._decode_with_java_server(java_exe, sig, a1, a2)
+        if isinstance(plain, string_types):
+          self._decode_cache[cache_key] = plain
+          return plain
       p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
       out, err = p.communicate()
       if p.returncode != 0:
         if DIAG:
           print('[D] java helper failed: %s' % err)
         return None
-      text = out.decode('utf-8').strip()
-      if not text:
-        return None
-      obj = json.loads(text)
-      if obj.get('type') == 'Ljava/lang/String;':
-        return obj.get('value')
-      return None
+      plain = self._parse_helper_output(out)
+      if isinstance(plain, string_types):
+        self._decode_cache[cache_key] = plain
+      return plain
     except Exception as e:
       if DIAG:
         print('[D] java helper exception: %s' % e)
       return None
 
+  def _decode_with_java_server(self, java_exe, sig, a1, a2):
+    proc = self._ensure_java_helper_process(java_exe)
+    if not proc:
+      return None
+    try:
+      payload = '%s\t%s\t%s\n' % (
+        sig,
+        ','.join(str(int(x)) for x in a1),
+        ','.join(str(int(x)) for x in a2),
+      )
+      proc.stdin.write(payload)
+      proc.stdin.flush()
+      line = proc.stdout.readline()
+      if not line:
+        err = proc.stderr.read()
+        if DIAG and err:
+          print('[D] java helper server closed: %s' % err)
+        self._close_java_helper()
+        return None
+      return self._parse_helper_output(line)
+    except Exception as e:
+      if DIAG:
+        print('[D] java helper server exception: %s' % e)
+      self._close_java_helper()
+      return None
+
+  def _ensure_java_helper_process(self, java_exe):
+    proc = self._java_helper_proc
+    try:
+      if proc and proc.poll() is None:
+        return proc
+    except Exception:
+      pass
+    self._close_java_helper()
+    cmd = [java_exe, '-jar', JAVA_HELPER_JAR, 'serve']
+    try:
+      self._java_helper_proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE
+      )
+      self._java_helper_mode = 'serve'
+      return self._java_helper_proc
+    except Exception as e:
+      if DIAG:
+        print('[D] start java helper server failed: %s' % e)
+      self._close_java_helper()
+      return None
+
+  def _parse_helper_output(self, raw):
+    if raw is None:
+      return None
+    try:
+      text = raw.decode('utf-8').strip()
+    except Exception:
+      try:
+        text = raw.strip()
+      except Exception:
+        return None
+    if not text:
+      return None
+    try:
+      obj = json.loads(text)
+    except Exception:
+      if DIAG:
+        print('[D] invalid helper json: %r' % text)
+      return None
+    if obj.get('type') == 'Ljava/lang/String;':
+      return obj.get('value')
+    return None
+
+  def _close_java_helper(self):
+    proc = getattr(self, '_java_helper_proc', None)
+    if not proc:
+      return
+    self._java_helper_proc = None
+    try:
+      if proc.stdin:
+        proc.stdin.close()
+    except Exception:
+      pass
+    try:
+      if proc.stdout:
+        proc.stdout.close()
+    except Exception:
+      pass
+    try:
+      if proc.stderr:
+        proc.stderr.close()
+    except Exception:
+      pass
+    try:
+      if proc.poll() is None:
+        proc.terminate()
+    except Exception:
+      pass
+
+  def _fallback_decode(self, sig, a1, a2):
+    if sig not in TARGET_METHOD_SIGS:
+      return None
+    if not a2:
+      return ''
+    out = []
+    l2 = len(a2)
+    try:
+      for i, x in enumerate(a1):
+        y = a2[i % l2]
+        out.append((int(x) ^ int(y)) & 0xFF)
+    except Exception:
+      return None
+    try:
+      return bytearray(out).decode('utf-8')
+    except Exception:
+      try:
+        return bytearray(out).decode('latin-1')
+      except Exception:
+        return None
+
   def _extract_byte_array(self, e):
+    cache_key = None
     try:
       if isinstance(e, IJavaIdentifier):
         v = self.locals.get(e.getName())
@@ -588,6 +738,13 @@ class ManualTargetStringReplace(IScript):
           return list(v)
     except Exception:
       pass
+    try:
+      cache_key = id(e)
+      cached = self._byte_array_cache.get(cache_key)
+      if cached is not None:
+        return list(cached) if cached else None
+    except Exception:
+      cache_key = None
 
     try:
       if isinstance(e, IJavaNewArray):
@@ -599,16 +756,24 @@ class ManualTargetStringReplace(IScript):
               return None
             bv = parse_byte_literal(v.getValue())
             if bv is None:
+              if cache_key is not None:
+                self._byte_array_cache[cache_key] = ()
               return None
             out.append(bv)
-          return out if out else None
+          result = out if out else None
+          if cache_key is not None:
+            self._byte_array_cache[cache_key] = tuple(result or ())
+          return result
         try:
           s = str(e)
           m = re.search(r'new\s+byte\s*\[\s*([^\]]+)\s*\]', s)
           if m:
             n = parse_int(m.group(1))
             if n >= 0:
-              return [0] * n
+              result = [0] * n
+              if cache_key is not None:
+                self._byte_array_cache[cache_key] = tuple(result)
+              return result
         except Exception:
           pass
     except Exception:
@@ -619,12 +784,19 @@ class ManualTargetStringReplace(IScript):
         out = []
         for x in e.getSubElements():
           if not isinstance(x, IJavaConstant):
+            if cache_key is not None:
+              self._byte_array_cache[cache_key] = ()
             return None
           v = parse_byte_literal(x.getValue())
           if v is None:
+            if cache_key is not None:
+              self._byte_array_cache[cache_key] = ()
             return None
           out.append(v)
-        return out if out else None
+        result = out if out else None
+        if cache_key is not None:
+          self._byte_array_cache[cache_key] = tuple(result or ())
+        return result
     except Exception:
       pass
 
@@ -641,6 +813,8 @@ class ManualTargetStringReplace(IScript):
             break
           out.append(v)
         if ok and out:
+          if cache_key is not None:
+            self._byte_array_cache[cache_key] = tuple(out)
           return out
     except Exception:
       pass
@@ -655,75 +829,110 @@ class ManualTargetStringReplace(IScript):
         for p in parts:
           v = parse_byte_literal(p)
           if v is None:
+            if cache_key is not None:
+              self._byte_array_cache[cache_key] = ()
             return None
           out.append(v)
-        return out if out else None
+        result = out if out else None
+        if cache_key is not None:
+          self._byte_array_cache[cache_key] = tuple(result or ())
+        return result
     except Exception:
       pass
 
+    if cache_key is not None:
+      self._byte_array_cache[cache_key] = ()
     return None
 
-  def _collect_assignments(self, e):
+  def _apply_assignment(self, e):
     try:
-      if isinstance(e, IJavaAssignment):
-        left = e.getLeft()
-        right = e.getRight()
-        if isinstance(left, IJavaIdentifier):
-          arr = self._extract_byte_array(right)
-          if arr is not None:
-            self.locals[left.getName()] = list(arr)
-        elif isinstance(left, IJavaArrayElt):
-          arr_name = self._get_array_name(left.getArray())
-          idx = self._get_const_int(left.getIndex())
-          val = self._get_const_byte(right)
-          if arr_name is not None and idx is not None and val is not None:
-            arr = self.locals.get(arr_name)
-            if arr is not None and 0 <= idx < len(arr):
-              arr[idx] = val
+      left = e.getLeft()
+      right = e.getRight()
+      if isinstance(left, IJavaIdentifier):
+        arr = self._extract_byte_array(right)
+        if arr is not None:
+          self.locals[left.getName()] = list(arr)
+      elif isinstance(left, IJavaArrayElt):
+        arr_name = self._get_array_name(left.getArray())
+        idx = self._get_const_int(left.getIndex())
+        val = self._get_const_byte(right)
+        if arr_name is not None and idx is not None and val is not None:
+          arr = self.locals.get(arr_name)
+          if arr is not None and 0 <= idx < len(arr):
+            arr[idx] = val
     except Exception:
       pass
-
-    try:
-      subs = e.getSubElements()
-    except Exception:
-      return
-    for sub in subs:
-      if isinstance(sub, (IJavaClass, IJavaField, IJavaMethod)):
-        continue
-      self._collect_assignments(sub)
 
   def _get_array_name(self, e):
     try:
+      cache_key = id(e)
+      if cache_key in self._array_name_cache:
+        return self._array_name_cache[cache_key]
+    except Exception:
+      cache_key = None
+    try:
       if isinstance(e, IJavaIdentifier):
-        return e.getName()
+        name = e.getName()
+        if cache_key is not None:
+          self._array_name_cache[cache_key] = name
+        return name
     except Exception:
       pass
     try:
       for sub in e.getSubElements():
         name = self._get_array_name(sub)
         if name is not None:
+          if cache_key is not None:
+            self._array_name_cache[cache_key] = name
           return name
     except Exception:
       pass
+    if cache_key is not None:
+      self._array_name_cache[cache_key] = None
     return None
 
   def _get_const_int(self, e):
     try:
+      cache_key = id(e)
+      if cache_key in self._const_int_cache:
+        return self._const_int_cache[cache_key]
+    except Exception:
+      cache_key = None
+    try:
       if isinstance(e, IJavaConstant):
         if hasattr(e, 'getInt'):
-          return int(e.getInt())
-        return parse_int(e.getValue())
+          value = int(e.getInt())
+          if cache_key is not None:
+            self._const_int_cache[cache_key] = value
+          return value
+        value = parse_int(e.getValue())
+        if cache_key is not None:
+          self._const_int_cache[cache_key] = value
+        return value
     except Exception:
       pass
     try:
-      return parse_int(str(e))
+      value = parse_int(str(e))
+      if cache_key is not None:
+        self._const_int_cache[cache_key] = value
+      return value
     except Exception:
+      if cache_key is not None:
+        self._const_int_cache[cache_key] = None
       return None
 
   def _get_const_byte(self, e):
     try:
+      cache_key = id(e)
+      if cache_key in self._const_byte_cache:
+        return self._const_byte_cache[cache_key]
+    except Exception:
+      cache_key = None
+    try:
       v = parse_byte_literal(str(e))
       if v is not None:
+        if cache_key is not None:
+          self._const_byte_cache[cache_key] = v
         return v
     except Exception:
       pass
@@ -732,11 +941,21 @@ class ManualTargetStringReplace(IScript):
         if hasattr(e, 'getValue'):
           v = parse_byte_literal(e.getValue())
           if v is not None:
+            if cache_key is not None:
+              self._const_byte_cache[cache_key] = v
             return v
         if hasattr(e, 'getByte'):
-          return parse_byte_literal(e.getByte())
+          v = parse_byte_literal(e.getByte())
+          if cache_key is not None:
+            self._const_byte_cache[cache_key] = v
+          return v
         if hasattr(e, 'getInt'):
-          return parse_byte_literal(e.getInt())
+          v = parse_byte_literal(e.getInt())
+          if cache_key is not None:
+            self._const_byte_cache[cache_key] = v
+          return v
     except Exception:
       pass
+    if cache_key is not None:
+      self._const_byte_cache[cache_key] = None
     return None

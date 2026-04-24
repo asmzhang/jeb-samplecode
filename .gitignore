@@ -3,3 +3,16 @@ libs
 temp
 .classpath
 .project
+__pycache__/
+*.pyc
+*$py.class
+
+.idea/
+.vscode/
+
+decode/.gradle/
+decode/build/
+decode/out/
+decode/*.iml
+
+decode-helper/build/

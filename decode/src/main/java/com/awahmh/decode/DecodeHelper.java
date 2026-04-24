@@ -6,6 +6,8 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.lang.reflect.Method;
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
 
 public final class DecodeHelper {
     private static final Map<String, String> TARGET_ALIASES = new HashMap<String, String>();
@@ -79,6 +81,7 @@ public final class DecodeHelper {
     private static void usage() {
         System.err.println("Usage:");
         System.err.println("  java -jar decode.jar invoke --target \"Lcom/awahmh/decode/i1iIiI1iIiIiIiiI1iI;->oOoooOoooOOOooo([B[B)Ljava/lang/String;\" --arg \"118,-60,-71\" --arg \"3,-74,-43,1,25,-37,-105,32,60,101,18\"");
+        System.err.println("  java -jar decode.jar serve");
     }
 
     public static void main(String[] args) {
@@ -106,36 +109,77 @@ public final class DecodeHelper {
             }
         }
 
+        if("serve".equals(mode)) {
+            serveLoop();
+            return;
+        }
+
         if(!"invoke".equals(mode) || target == null) {
             usage();
             System.exit(2);
         }
 
         try {
-            Dextarget parsed = parseTarget(normalizeTarget(target));
-            if(parsed.paramDescriptors.size() != argValues.size()) {
-                throw new IllegalArgumentException("Argument count mismatch: need " + parsed.paramDescriptors.size() + " got " + argValues.size());
-            }
-
-            Class<?> owner = Class.forName(parsed.className);
-            Class<?>[] parameterTypes = new Class<?>[parsed.paramDescriptors.size()];
-            Object[] invokeArgs = new Object[parsed.paramDescriptors.size()];
-            for(int i = 0; i < parsed.paramDescriptors.size(); i++) {
-                String descriptor = parsed.paramDescriptors.get(i);
-                parameterTypes[i] = classForDescriptor(descriptor);
-                invokeArgs[i] = valueForDescriptor(descriptor, argValues.get(i));
-            }
-
-            Method m = owner.getDeclaredMethod(parsed.methodName, parameterTypes);
-            m.setAccessible(true);
-            Object result = m.invoke(null, invokeArgs);
-            System.out.println(toJsonResult(parsed.returnDescriptor, result));
+            System.out.println(invokeTarget(target, argValues));
             return;
         }
         catch(Exception e) {
             System.err.println(e.toString());
             System.exit(1);
         }
+    }
+
+    private static void serveLoop() {
+        try {
+            BufferedReader reader = new BufferedReader(new InputStreamReader(System.in, "UTF-8"));
+            String line;
+            while((line = reader.readLine()) != null) {
+                if(line.trim().isEmpty()) {
+                    continue;
+                }
+                try {
+                    String[] parts = line.split("\t", -1);
+                    if(parts.length < 1) {
+                        throw new IllegalArgumentException("Missing target");
+                    }
+                    String target = parts[0];
+                    List<String> argValues = new ArrayList<String>();
+                    for(int i = 1; i < parts.length; i++) {
+                        argValues.add(parts[i]);
+                    }
+                    System.out.println(invokeTarget(target, argValues));
+                }
+                catch(Exception e) {
+                    System.out.println("{\"type\":\"error\",\"value\":" + toJsonString(String.valueOf(e)) + "}");
+                }
+                System.out.flush();
+            }
+        }
+        catch(Exception e) {
+            System.err.println(e.toString());
+            System.exit(1);
+        }
+    }
+
+    private static String invokeTarget(String target, List<String> argValues) throws Exception {
+        Dextarget parsed = parseTarget(normalizeTarget(target));
+        if(parsed.paramDescriptors.size() != argValues.size()) {
+            throw new IllegalArgumentException("Argument count mismatch: need " + parsed.paramDescriptors.size() + " got " + argValues.size());
+        }
+
+        Class<?> owner = Class.forName(parsed.className);
+        Class<?>[] parameterTypes = new Class<?>[parsed.paramDescriptors.size()];
+        Object[] invokeArgs = new Object[parsed.paramDescriptors.size()];
+        for(int i = 0; i < parsed.paramDescriptors.size(); i++) {
+            String descriptor = parsed.paramDescriptors.get(i);
+            parameterTypes[i] = classForDescriptor(descriptor);
+            invokeArgs[i] = valueForDescriptor(descriptor, argValues.get(i));
+        }
+
+        Method m = owner.getDeclaredMethod(parsed.methodName, parameterTypes);
+        m.setAccessible(true);
+        Object result = m.invoke(null, invokeArgs);
+        return toJsonResult(parsed.returnDescriptor, result);
     }
 
     private static final class Dextarget {
