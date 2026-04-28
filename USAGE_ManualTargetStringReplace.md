@@ -7,11 +7,13 @@
 它依赖外部 Java helper：
 
 - [decode-1.0-SNAPSHOT.jar](/d:/Apps/com.awahmh.qcmpkbcuhv/jeb-samplecode/decode/build/libs/decode-1.0-SNAPSHOT.jar)
+- [decode_targets.json](/d:/tools/JEB_demo_5.36.0.202601300012_by_CXV/jeb-samplecode/decode/src/main/resources/decode_targets.json)
 
 ## 当前支持的目标函数
 
 - `Lcom/mbridge/msdk/shell/MBService;->oOoooOoooOOOooo([B[B)Ljava/lang/String;`
 - `Li1iIiI1iIiIiIiiI1iI;->oOoooOoooOOOooo([B[B)Ljava/lang/String;`
+- `LiiIiiiI1i1iI1iIiI;->oOoooOoooOOOooo([B[B)Ljava/lang/String;`
 
 ## 工作方式
 
@@ -38,6 +40,7 @@
 - [DecodeHelper.java](/d:/Apps/com.awahmh.qcmpkbcuhv/jeb-samplecode/decode/src/main/java/com/awahmh/decode/DecodeHelper.java)
 - [i1iIiI1iIiIiIiiI1iI.java](/d:/Apps/com.awahmh.qcmpkbcuhv/jeb-samplecode/decode/src/main/java/com/awahmh/decode/i1iIiI1iIiIiIiiI1iI.java)
 - [MBService.java](/d:/Apps/com.awahmh.qcmpkbcuhv/jeb-samplecode/decode/src/main/java/com/awahmh/decode/MBService.java)
+- [decode_targets.json](/d:/tools/JEB_demo_5.36.0.202601300012_by_CXV/jeb-samplecode/decode/src/main/resources/decode_targets.json)
 
 构建命令：
 
@@ -59,11 +62,13 @@ gradlew.bat clean jar
 `decode` 目录下的 Java 工程负责真正执行解密逻辑：
 
 - [DecodeHelper.java](/d:/Apps/com.awahmh.qcmpkbcuhv/jeb-samplecode/decode/src/main/java/com/awahmh/decode/DecodeHelper.java)
-  负责命令行入口、参数解析、DEX 签名映射、反射调用
+  负责命令行入口、参数解析、读取 `decode_targets.json`、反射调用
 - [i1iIiI1iIiIiIiiI1iI.java](/d:/Apps/com.awahmh.qcmpkbcuhv/jeb-samplecode/decode/src/main/java/com/awahmh/decode/i1iIiI1iIiIiIiiI1iI.java)
   对应 `Li1iIiI1iIiIiIiiI1iI;->oOoooOoooOOOooo([B[B)Ljava/lang/String;`
 - [MBService.java](/d:/Apps/com.awahmh.qcmpkbcuhv/jeb-samplecode/decode/src/main/java/com/awahmh/decode/MBService.java)
   对应 `Lcom/mbridge/msdk/shell/MBService;->oOoooOoooOOOooo([B[B)Ljava/lang/String;`
+- [decode_targets.json](/d:/tools/JEB_demo_5.36.0.202601300012_by_CXV/jeb-samplecode/decode/src/main/resources/decode_targets.json)
+  是 Python 脚本和 Java helper 共用的目标注册表
 
 ### 2. ManualTargetStringReplace.py 负责什么
 
@@ -96,17 +101,21 @@ invoke
 
 脚本传给 jar 的是原始样本里的 DEX/Smali 签名，不是 `decode` 工程里的类名。
 
-`DecodeHelper.java` 内部会把原始签名映射到 `decode` 工程里的实际实现类，例如：
+`decode_targets.json` 会把原始签名映射到 `decode` 工程里的实际实现类，例如：
 
 - `Li1iIiI1iIiIiIiiI1iI;->oOoooOoooOOOooo([B[B)Ljava/lang/String;`
   映射到
-- `Lcom/awahmh/decode/i1iIiI1iIiIiIiiI1iI;->oOoooOoooOOOooo([B[B)Ljava/lang/String;`
+- `com.awahmh.decode.MBService`
+
+- `LiiIiiiI1i1iI1iIiI;->oOoooOoooOOOooo([B[B)Ljava/lang/String;`
+  映射到
+- `com.awahmh.decode.MBService`
 
 以及：
 
 - `Lcom/mbridge/msdk/shell/MBService;->oOoooOoooOOOooo([B[B)Ljava/lang/String;`
   映射到
-- `Lcom/awahmh/decode/MBService;->oOoooOoooOOOooo([B[B)Ljava/lang/String;`
+- `com.awahmh.decode.MBService`
 
 所以：
 
@@ -125,7 +134,7 @@ invoke
 如果你新增新的目标解密函数：
 
 1. 在 [ManualTargetStringReplace.py](/d:/Apps/com.awahmh.qcmpkbcuhv/jeb-samplecode/ManualTargetStringReplace.py) 的 `TARGET_METHOD_SIGS` 里加入原始 DEX 签名
-2. 在 [DecodeHelper.java](/d:/Apps/com.awahmh.qcmpkbcuhv/jeb-samplecode/decode/src/main/java/com/awahmh/decode/DecodeHelper.java) 的签名映射里加入对应映射
+2. 在 [decode_targets.json](/d:/tools/JEB_demo_5.36.0.202601300012_by_CXV/jeb-samplecode/decode/src/main/resources/decode_targets.json) 里加入 `dexSig -> implClass` 映射
 3. 如果需要，新增对应 Java 实现类
 4. 重新构建 jar
 

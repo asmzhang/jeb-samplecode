@@ -7,21 +7,47 @@ import java.util.List;
 import java.util.Map;
 import java.lang.reflect.Method;
 import java.io.BufferedReader;
+import java.io.ByteArrayOutputStream;
+import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 public final class DecodeHelper {
-    private static final Map<String, String> TARGET_ALIASES = new HashMap<String, String>();
-
-    static {
-        String helperSig = "Lcom/awahmh/decode/i1iIiI1iIiIiIiiI1iI;->oOoooOoooOOOooo([B[B)Ljava/lang/String;";
-        String mbSig = "Lcom/awahmh/decode/MBService;->oOoooOoooOOOooo([B[B)Ljava/lang/String;";
-        TARGET_ALIASES.put(helperSig, helperSig);
-        TARGET_ALIASES.put(mbSig, mbSig);
-        TARGET_ALIASES.put("Li1iIiI1iIiIiIiiI1iI;->oOoooOoooOOOooo([B[B)Ljava/lang/String;", helperSig);
-        TARGET_ALIASES.put("Lcom/mbridge/msdk/shell/MBService;->oOoooOoooOOOooo([B[B)Ljava/lang/String;", mbSig);
-    }
+    private static final Pattern TARGET_ENTRY_PATTERN = Pattern.compile(
+        "\\{\\s*\"dexSig\"\\s*:\\s*\"([^\"]+)\"\\s*,\\s*\"implClass\"\\s*:\\s*\"([^\"]+)\"\\s*\\}"
+    );
+    private static final Map<String, String> TARGET_CLASS_ALIASES = loadTargetClassAliases();
 
     private DecodeHelper() {
+    }
+
+    private static Map<String, String> loadTargetClassAliases() {
+        try(InputStream in = DecodeHelper.class.getClassLoader().getResourceAsStream("decode_targets.json")) {
+            if(in == null) {
+                throw new IllegalStateException("Missing decode_targets.json resource");
+            }
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            byte[] buf = new byte[4096];
+            int n;
+            while((n = in.read(buf)) >= 0) {
+                out.write(buf, 0, n);
+            }
+            String text = out.toString(StandardCharsets.UTF_8.name());
+            Matcher m = TARGET_ENTRY_PATTERN.matcher(text);
+            Map<String, String> aliases = new HashMap<String, String>();
+            while(m.find()) {
+                aliases.put(m.group(1), m.group(2));
+            }
+            if(aliases.isEmpty()) {
+                throw new IllegalStateException("No target entries found in decode_targets.json");
+            }
+            return aliases;
+        }
+        catch(Exception e) {
+            throw new ExceptionInInitializerError(e);
+        }
     }
 
     private static byte[] parseCsvBytes(String s) {
@@ -215,8 +241,16 @@ public final class DecodeHelper {
     }
 
     private static String normalizeTarget(String target) {
-        String mapped = TARGET_ALIASES.get(target);
-        return mapped != null ? mapped : target;
+        String implClass = TARGET_CLASS_ALIASES.get(target);
+        if(implClass == null) {
+            return target;
+        }
+
+        int p = target.indexOf("->");
+        if(p < 0) {
+            throw new IllegalArgumentException("Invalid DEX target: " + target);
+        }
+        return "L" + implClass.replace('.', '/') + ";" + target.substring(p);
     }
 
     private static List<String> parseParameterDescriptors(String s) {

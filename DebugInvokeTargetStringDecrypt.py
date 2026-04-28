@@ -2,13 +2,35 @@
 #?shortcut=
 from __future__ import print_function
 
+import json
+import os
+
 from com.pnfsoftware.jeb.client.api import IScript, IGraphicalClientContext
 from com.pnfsoftware.jeb.core.units.code.java import IJavaSourceUnit, IJavaClass, IJavaMethod, IJavaCall
 
-TARGET_METHOD_SIGS = [
-    "Lcom/mbridge/msdk/shell/MBService;->oOoooOoooOOOooo([B[B)Ljava/lang/String;",
-    "Li1iIiI1iIiIiIiiI1iI;->oOoooOoooOOOooo([B[B)Ljava/lang/String;",
-]
+TARGETS_JSON = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    'decode', 'src', 'main', 'resources', 'decode_targets.json'
+)
+
+try:
+    string_types = (basestring,)
+except NameError:
+    string_types = (str,)
+
+
+def load_target_method_sigs():
+    with open(TARGETS_JSON, 'r') as f:
+        data = json.load(f)
+    out = []
+    for item in data:
+        sig = item.get('dexSig')
+        if isinstance(sig, string_types) and sig:
+            out.append(sig)
+    return out
+
+
+TARGET_METHOD_SIGS = load_target_method_sigs()
 
 
 class DebugInvokeTargetStringDecrypt(IScript):

@@ -3,9 +3,9 @@
 # -*- coding: utf-8 -*-
 from __future__ import print_function
 
+import json
 import os
 import re
-import json
 import subprocess
 
 from com.pnfsoftware.jeb.client.api import IScript, IGraphicalClientContext
@@ -16,10 +16,10 @@ from com.pnfsoftware.jeb.core.units.code.java import (
 )
 
 
-TARGET_METHOD_SIGS = [
-  "Lcom/mbridge/msdk/shell/MBService;->oOoooOoooOOOooo([B[B)Ljava/lang/String;",
-  "Li1iIiI1iIiIiIiiI1iI;->oOoooOoooOOOooo([B[B)Ljava/lang/String;",
-]
+TARGETS_JSON = os.path.join(
+  os.path.dirname(os.path.abspath(__file__)),
+  'decode', 'src', 'main', 'resources', 'decode_targets.json'
+)
 
 # Run mode switch:
 # - 'method': only current method
@@ -29,7 +29,7 @@ TARGET_METHOD_SIGS = [
 DEFAULT_MODE = 'all'
 
 PRINT_HITS = True
-DIAG = False
+DIAG = True
 USE_JAVA_HELPER = True
 JAVA_HELPER_JAR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'decode', 'build', 'libs', 'decode-1.0-SNAPSHOT.jar')
 JAVA_HELPER_MODE = 'serve'
@@ -44,6 +44,20 @@ try:
   string_types = (basestring,)
 except NameError:
   string_types = (str,)
+
+
+def load_target_method_sigs():
+  with open(TARGETS_JSON, 'r') as f:
+    data = json.load(f)
+  out = []
+  for item in data:
+    sig = item.get('dexSig')
+    if isinstance(sig, string_types) and sig:
+      out.append(sig)
+  return out
+
+
+TARGET_METHOD_SIGS = load_target_method_sigs()
 
 
 def parse_int(v):
@@ -429,7 +443,8 @@ class ManualTargetStringReplace(IScript):
           if not isinstance(root, IJavaClass):
             continue
           total_units += 1
-          self.cstbuilder = unit.getDecompiler().getHighLevelContext().getConstantFactory()
+          self.jfactory = unit.getDecompiler().getHighLevelContext()
+          self.cstbuilder = self.jfactory.getConstantFactory()
           n = self._process_class(root)
           if n:
             self.replcnt += n
@@ -446,7 +461,8 @@ class ManualTargetStringReplace(IScript):
       if not isinstance(root, IJavaClass):
         print('[!] Focus a Java class first')
         return
-      self.cstbuilder = unit.getDecompiler().getHighLevelContext().getConstantFactory()
+      self.jfactory = unit.getDecompiler().getHighLevelContext()
+      self.cstbuilder = self.jfactory.getConstantFactory()
 
       focused_method = self._get_focused_method(f)
       if mode == 'method':
@@ -497,8 +513,12 @@ class ManualTargetStringReplace(IScript):
     i = 0
     while i < body.size():
       stm = body.get(i)
+      if self._try_replace_noop_call_statement(body, i, stm):
+        count += 1
+        i += 1
+        continue
       pending_assignments = []
-      count += self._visit_element(body, stm, pending_assignments)
+      count += self._visit_element(body, stm, pending_assignments, [body, stm])
       for assignment in pending_assignments:
         self._apply_assignment(assignment)
       i += 1
@@ -513,9 +533,9 @@ class ManualTargetStringReplace(IScript):
         count += self._process_class(sub)
     return count
 
-  def _visit_element(self, parent, e, pending_assignments):
+  def _visit_element(self, parent, e, pending_assignments, chain):
     count = 0
-    if isinstance(e, IJavaCall) and self._try_replace_call(parent, e):
+    if isinstance(e, IJavaCall) and self._try_replace_call(chain, e):
       count += 1
     if isinstance(e, IJavaAssignment):
       pending_assignments.append(e)
@@ -526,41 +546,218 @@ class ManualTargetStringReplace(IScript):
     for sub in subs:
       if isinstance(sub, (IJavaClass, IJavaField, IJavaMethod)):
         continue
-      count += self._visit_element(e, sub, pending_assignments)
+      count += self._visit_element(e, sub, pending_assignments, chain + [sub])
     return count
 
-  def _try_replace_call(self, parent, call):
+  def _try_replace_noop_call_statement(self, body, index, stm):
+    call = self._extract_direct_call_statement(stm)
+    if call is None:
+      return False
+    plain = self._decode_target_call(call)
+    if plain is None:
+      return False
+    repl = self._create_noop_string_statement(plain)
+    if repl is None:
+      return False
+    try:
+      result = body.set(index, repl)
+      if DIAG:
+        print('[D] body.set(%d) => %r for %s' % (index, result, self._safe_type_name(stm)))
+      return True
+    except Exception as e:
+      if DIAG:
+        print('[D] body.set failed for %s: %s' % (self._safe_type_name(stm), e))
+    try:
+      result = body.replaceSubElement(stm, repl)
+      if DIAG:
+        print('[D] body.replaceSubElement => %r for %s' % (result, self._safe_type_name(stm)))
+      return bool(result)
+    except Exception as e:
+      if DIAG:
+        print('[D] body.replaceSubElement failed for %s: %s' % (self._safe_type_name(stm), e))
+    try:
+      subs = body.getSubElements()
+      idx = self._find_sub_index(subs, stm)
+      if idx is not None:
+        result = subs.set(idx, repl)
+        if DIAG:
+          print('[D] body.getSubElements().set(%d) => %r for %s' % (idx, result, self._safe_type_name(stm)))
+        return True
+    except Exception as e:
+      if DIAG:
+        print('[D] body.getSubElements().set failed for %s: %s' % (self._safe_type_name(stm), e))
+    return False
+
+  def _extract_direct_call_statement(self, e):
+    cur = e
+    for depth in range(8):
+      filtered = self._get_filtered_subs(cur)
+      if filtered is None:
+        return None
+      if len(filtered) != 1:
+        if DIAG:
+          print('[D] skip statement with %d sub-elements: %s' % (len(filtered), self._safe_type_name(cur)))
+        return None
+      child = filtered[0]
+      if isinstance(child, IJavaCall):
+        if depth > 0 and DIAG:
+          print('[D] unwrapped statement chain: %s -> %s' % (self._safe_type_name(e), self._safe_type_name(child)))
+        return child
+      if DIAG:
+        print('[D] unwrap statement: %s -> %s' % (self._safe_type_name(cur), self._safe_type_name(child)))
+      cur = child
+    return None
+
+  def _get_filtered_subs(self, e):
+    try:
+      subs = e.getSubElements()
+    except Exception:
+      return None
+    if not subs:
+      return []
+    filtered = []
+    try:
+      size = subs.size()
+      for i in range(size):
+        sub = subs.get(i)
+        if isinstance(sub, (IJavaClass, IJavaField, IJavaMethod)):
+          continue
+        filtered.append(sub)
+      return filtered
+    except Exception:
+      try:
+        for sub in subs:
+          if isinstance(sub, (IJavaClass, IJavaField, IJavaMethod)):
+            continue
+          filtered.append(sub)
+        return filtered
+      except Exception:
+        return None
+
+  def _create_noop_string_statement(self, plain):
+    try:
+      m = self.jfactory.createMethodReference('Ljava/lang/String;-><init>(Ljava/lang/String;)V', False)
+      t = self.jfactory.getTypeFactory().createType('Ljava/lang/String;')
+      args = [self.cstbuilder.createString(plain)]
+      return self.jfactory.createNew(t, m, args)
+    except Exception:
+      return None
+
+  def _decode_target_call(self, call):
     sig = str(call.getMethod().getSignature())
     if sig not in TARGET_METHOD_SIGS:
-      return False
+      return None
 
     args = call.getArguments()
     if not args or len(args) != 2:
-      return False
+      return None
 
     a1 = self._extract_byte_array(args[0])
     a2 = self._extract_byte_array(args[1])
     if a1 is None or a2 is None:
       if DIAG:
         print('[D] skip non-literal args: %s' % sig)
-      return False
+      return None
 
     plain = self._decode_with_java(sig, a1, a2)
-    used_fallback = False
-    if not isinstance(plain, string_types):
-      plain = self._fallback_decode(sig, a1, a2)
-      used_fallback = isinstance(plain, string_types)
     if not isinstance(plain, string_types):
       print('[!] decode failed: %s' % sig)
-      return False
+      return None
 
     if PRINT_HITS:
       print('[+] %s => %r' % (sig, plain))
-      if used_fallback:
-        print('[*] fallback used: %s' % sig)
+    return plain
 
-    parent.replaceSubElement(call, self.cstbuilder.createString(plain))
-    return True
+  def _try_replace_call(self, chain, call):
+    plain = self._decode_target_call(call)
+    if plain is None:
+      return False
+    repl = self.cstbuilder.createString(plain)
+    return self._replace_call_via_ancestors(chain, call, repl)
+
+  def _replace_call_via_ancestors(self, chain, call, repl):
+    if not chain:
+      return False
+    if DIAG:
+      try:
+        names = [self._safe_type_name(x) for x in chain]
+        print('[D] call chain: %s' % ' -> '.join(names))
+      except Exception:
+        pass
+
+    child = call
+    for i in range(len(chain) - 2, -1, -1):
+      parent = chain[i]
+      if self._replace_child_on_parent(parent, child, repl):
+        return True
+      child = parent
+    return False
+
+  def _replace_child_on_parent(self, parent, child, repl):
+    try:
+      result = parent.replaceSubElement(child, repl)
+      if DIAG:
+        print('[D] replaceSubElement(%s <- %s) => %r' % (
+          self._safe_type_name(parent),
+          self._safe_type_name(child),
+          result
+        ))
+      if result:
+        return True
+    except Exception as e:
+      if DIAG:
+        print('[D] replaceSubElement(%s <- %s) failed: %s' % (
+          self._safe_type_name(parent),
+          self._safe_type_name(child),
+          e
+        ))
+    try:
+      subs = parent.getSubElements()
+      idx = self._find_sub_index(subs, child)
+      if idx is None:
+        if DIAG:
+          print('[D] child not found in getSubElements(): %s <- %s' % (
+            self._safe_type_name(parent),
+            self._safe_type_name(child)
+          ))
+        return False
+      result = subs.set(idx, repl)
+      if DIAG:
+        print('[D] getSubElements().set(%s[%d] <- %s) => %r' % (
+          self._safe_type_name(parent),
+          idx,
+          self._safe_type_name(child),
+          result
+        ))
+      return True
+    except Exception as e:
+      if DIAG:
+        print('[D] getSubElements().set(%s <- %s) failed: %s' % (
+          self._safe_type_name(parent),
+          self._safe_type_name(child),
+          e
+        ))
+      return False
+
+  def _find_sub_index(self, subs, target):
+    try:
+      size = subs.size()
+      for i in range(size):
+        x = subs.get(i)
+        if x is target or x == target:
+          return i
+    except Exception:
+      pass
+    return None
+
+  def _safe_type_name(self, obj):
+    try:
+      return obj.getClass().getName()
+    except Exception:
+      try:
+        return obj.__class__.__name__
+      except Exception:
+        return '<unknown>'
 
   def _decode_with_java(self, sig, a1, a2):
     cache_key = (sig, tuple(a1), tuple(a2))
@@ -707,27 +904,6 @@ class ManualTargetStringReplace(IScript):
         proc.terminate()
     except Exception:
       pass
-
-  def _fallback_decode(self, sig, a1, a2):
-    if sig not in TARGET_METHOD_SIGS:
-      return None
-    if not a2:
-      return ''
-    out = []
-    l2 = len(a2)
-    try:
-      for i, x in enumerate(a1):
-        y = a2[i % l2]
-        out.append((int(x) ^ int(y)) & 0xFF)
-    except Exception:
-      return None
-    try:
-      return bytearray(out).decode('utf-8')
-    except Exception:
-      try:
-        return bytearray(out).decode('latin-1')
-      except Exception:
-        return None
 
   def _extract_byte_array(self, e):
     cache_key = None

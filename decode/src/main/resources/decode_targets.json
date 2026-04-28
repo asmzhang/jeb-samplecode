@@ -1,0 +1,14 @@
+[
+  {
+    "dexSig": "Li1iIiI1iIiIiIiiI1iI;->oOoooOoooOOOooo([B[B)Ljava/lang/String;",
+    "implClass": "com.awahmh.decode.MBService"
+  },
+  {
+    "dexSig": "LiiIiiiI1i1iI1iIiI;->oOoooOoooOOOooo([B[B)Ljava/lang/String;",
+    "implClass": "com.awahmh.decode.MBService"
+  },
+  {
+    "dexSig": "Lcom/mbridge/msdk/shell/MBService;->oOoooOoooOOOooo([B[B)Ljava/lang/String;",
+    "implClass": "com.awahmh.decode.MBService"
+  }
+]
